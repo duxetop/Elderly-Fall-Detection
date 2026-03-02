@@ -310,20 +310,13 @@ def draw_bbox(frame, feat):
 
 
 def draw_debug(frame, tracker, thresholds):
-    """ Debugging panel"""
-    h, w = frame.shape[:2]
+    """Render debug info into a separate side panel and return it."""
+    h = frame.shape[0]
     pw = 260
-    px_start = w - pw - 5
+    panel = np.zeros((h, pw + 10, 3), dtype=np.uint8)
+
     feat = tracker.last_features
-
-    # Background
-    overlay = frame[5:h-5, px_start-5:w-5]
-    cv2.rectangle(frame, (px_start-5, 5), (w-5, h-5), (0,0,0), -1)
-    # Blend
-    if overlay.size > 0:
-        frame[5:h-5, px_start-5:w-5] = (overlay * 0.3).astype(np.uint8)
-
-    x = px_start
+    x = 5
     y = 22
     F = cv2.FONT_HERSHEY_SIMPLEX
     W = (255,255,255)
@@ -331,12 +324,12 @@ def draw_debug(frame, tracker, thresholds):
 
     # State
     sc = (0,0,255) if tracker.state in ('potential_fall','fallen') else (0,255,0)
-    cv2.putText(frame, f"STATE: {tracker.state.upper()}", (x,y), F, 0.5, sc, 1)
+    cv2.putText(panel, f"STATE: {tracker.state.upper()}", (x,y), F, 0.5, sc, 1)
     y += 22
 
     if feat is None:
-        cv2.putText(frame, "No keypoints (need shoulders + hips)", (x,y), F, 0.35, G, 1)
-        return
+        cv2.putText(panel, "No keypoints (need shoulders + hips)", (x,y), F, 0.35, G, 1)
+        return panel
 
     tt, rt, ht = thresholds['torso'], thresholds['ratio'], thresholds['hf']
 
@@ -345,15 +338,15 @@ def draw_debug(frame, tracker, thresholds):
         over = val > thresh
         c = (0,0,255) if over else (0,255,0)
         txt = f"{label}: {val:{fmt}}  (thresh: {thresh:{fmt}})"
-        cv2.putText(frame, txt, (x, y), F, 0.38, c, 1)
+        cv2.putText(panel, txt, (x, y), F, 0.38, c, 1)
         # Mini bar
         bar_y = y + 3
         bar_w = pw - 10
         ratio = max(0, min(1, val / (thresh * 2 + 1e-6)))
         t_pos = int((thresh / (thresh * 2 + 1e-6)) * bar_w)
-        cv2.rectangle(frame, (x, bar_y), (x + bar_w, bar_y + 6), (40,40,40), -1)
-        cv2.rectangle(frame, (x, bar_y), (x + int(ratio * bar_w), bar_y + 6), c, -1)
-        cv2.line(frame, (x + t_pos, bar_y - 1), (x + t_pos, bar_y + 7), (0,0,255), 1)
+        cv2.rectangle(panel, (x, bar_y), (x + bar_w, bar_y + 6), (40,40,40), -1)
+        cv2.rectangle(panel, (x, bar_y), (x + int(ratio * bar_w), bar_y + 6), c, -1)
+        cv2.line(panel, (x + t_pos, bar_y - 1), (x + t_pos, bar_y + 7), (0,0,255), 1)
         y += 24
 
     val_line("Torso", feat['torso_angle'], tt)
@@ -365,22 +358,22 @@ def draw_debug(frame, tracker, thresholds):
     val_line("Ratio", feat['aspect_ratio'], rt, ".2f")
 
     y += 5
-    cv2.putText(frame, f"keypoints: {feat['keypoint_count']}/17  "
+    cv2.putText(panel, f"keypoints: {feat['keypoint_count']}/17  "
                 f"sh:{feat['shoulder_conf']:.2f} hp:{feat['hip_conf']:.2f}",
                 (x, y), F, 0.33, G, 1)
     y += 16
-    cv2.putText(frame, f"center_y: {feat['center_y']:.3f}  "
+    cv2.putText(panel, f"center_y: {feat['center_y']:.3f}  "
                 f"norm_cy: {feat['normalized_cy']:.3f}",
                 (x, y), F, 0.33, G, 1)
     y += 16
-    cv2.putText(frame, f"bbox: {feat['bbox_width']:.2f}x{feat['bbox_height']:.2f}  "
+    cv2.putText(panel, f"bbox: {feat['bbox_width']:.2f}x{feat['bbox_height']:.2f}  "
                 f"ankle: {'Y' if feat['ankle_visible'] else 'N'}",
                 (x, y), F, 0.33, G, 1)
     y += 20
 
     up = is_upright(feat)
     fell = is_fallen(feat, tt, rt, ht)
-    cv2.putText(frame, f"upright={up}  fallen={fell}", (x, y), F, 0.4,
+    cv2.putText(panel, f"upright={up}  fallen={fell}", (x, y), F, 0.4,
                 (0,0,255) if fell else (0,255,0) if up else W, 1)
     y += 22
 
@@ -389,13 +382,13 @@ def draw_debug(frame, tracker, thresholds):
         nonlocal y
         if len(data) < 2:
             return
-        cv2.putText(frame, label, (x, y), F, 0.33, G, 1)
+        cv2.putText(panel, label, (x, y), F, 0.33, G, 1)
         y += 3
         gw, gh = pw - 10, 28
-        cv2.rectangle(frame, (x, y), (x+gw, y+gh), (30,30,30), -1)
+        cv2.rectangle(panel, (x, y), (x+gw, y+gh), (30,30,30), -1)
         # Threshold line
         tr = max(0, min(1, (thresh - vmin) / (vmax - vmin + 1e-6)))
-        cv2.line(frame, (x, y + gh - int(tr*gh)), (x+gw, y + gh - int(tr*gh)), (0,0,255), 1)
+        cv2.line(panel, (x, y + gh - int(tr*gh)), (x+gw, y + gh - int(tr*gh)), (0,0,255), 1)
         # Data line — sample every other point for speed
         pts = list(data)
         n = len(pts)
@@ -406,13 +399,15 @@ def draw_debug(frame, tracker, thresholds):
             px_pt = x + int(i / (n - 1 + 1e-6) * gw)
             py_pt = y + gh - int(r * gh)
             if prev is not None:
-                cv2.line(frame, prev, (px_pt, py_pt), color, 1)
+                cv2.line(panel, prev, (px_pt, py_pt), color, 1)
             prev = (px_pt, py_pt)
         y += gh + 8
 
     mini_graph("torso", tracker.torso_hist, 0, 90, tt, (0,200,255))
     mini_graph("ratio", tracker.ratio_hist, 0, 3, rt, (255,200,0))
     mini_graph("hd-ft", tracker.hf_hist, 0, 90, ht, (200,0,255))
+
+    return panel
 
 
 # Main
@@ -541,10 +536,6 @@ Examples:
                 cv2.putText(frame, "No body detected (need shoulders + hips visible)",
                             (10, iy), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150,150,150), 1)
 
-        # Debug panel
-        if show_debug:
-            draw_debug(frame, tracker, thresholds)
-
         # FPS
         fps_count += 1
         if now - fps_time > 1:
@@ -554,7 +545,14 @@ Examples:
         cv2.putText(frame, f"FPS:{fps_val:.0f} inf:{inf_ms:.0f}ms skip:{args.skip_frames}",
                     (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
 
-        cv2.imshow('Fall Detection', frame)
+        # Debug panel
+        if show_debug:
+            debug_panel = draw_debug(frame, tracker, thresholds)
+            display = np.hstack([frame, debug_panel])
+        else:
+            display = frame
+
+        cv2.imshow('Fall Detection', display)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
