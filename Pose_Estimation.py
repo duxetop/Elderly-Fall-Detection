@@ -212,7 +212,7 @@ def is_fallen(f, torso_t=50, ratio_t=1.0, hf_t=55):
 class FallTracker:
     def __init__(self, confirm_time=1.5, cooldown=5.0):
         self.state = 'unknown'
-        self.last_upright_t = 0.0
+        self.last_upright_t = time.time()
         self.fall_start_t = 0.0
         self.last_alert_t = 0.0
         self.cy_history = deque(maxlen=30)
@@ -220,6 +220,7 @@ class FallTracker:
         self.confirm_time = confirm_time
         self.cooldown = cooldown
         self.frames_missing = 0
+        self._first_detection = True
 
         # Debug histories
         self.torso_hist = deque(maxlen=90)
@@ -235,6 +236,10 @@ class FallTracker:
 
         self.frames_missing = 0
         self.last_features = feat
+
+        if self._first_detection:
+            self.last_upright_t = now
+            self._first_detection = False
 
         up = is_upright(feat)
         fell = is_fallen(feat, torso_t, ratio_t, hf_t)
