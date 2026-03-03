@@ -210,6 +210,12 @@ def is_fallen(f, torso_t=50, ratio_t=1.0, hf_t=55):
 
 # Fall state tracker
 class FallTracker:
+    # Grace period at startup before fall detection is active
+    STARTUP_GRACE = 3.0
+
+    # Max time to stay in potential_fall without confirming
+    POTENTIAL_FALL_TIMEOUT = 5.0
+
     def __init__(self, confirm_time=1.5, cooldown=5.0):
         self.state = 'unknown'
         self.last_upright_t = time.time()
@@ -221,6 +227,7 @@ class FallTracker:
         self.cooldown = cooldown
         self.frames_missing = 0
         self._first_detection = True
+        self._start_time = time.time()
 
         # Debug histories
         self.torso_hist = deque(maxlen=90)
@@ -230,18 +237,24 @@ class FallTracker:
     def update(self, feat, now, torso_t, ratio_t, hf_t, transition_t=1.5, record_debug=False):
         if feat is None:
             self.frames_missing += 1
+            # Reset potential_fall if tracking lost
             if self.frames_missing > 15 and self.state == 'potential_fall':
+                self.state = 'unknown'
+            if self.frames_missing > 90 and self.state == 'fallen':
                 self.state = 'unknown'
             return None
 
         self.frames_missing = 0
         self.last_features = feat
 
+        # On first valid detection refresh the upright timestamp
         if self._first_detection:
             self.last_upright_t = now
             self._first_detection = False
 
-        up = is_upright(feat)
+        upright_torso = torso_t * 0.7   # e.g. 50 * 0.7 = 35
+        upright_ratio = ratio_t * 0.9   # e.g. 1.0 * 0.9 = 0.9
+        up = is_upright(feat, upright_torso, upright_ratio)
         fell = is_fallen(feat, torso_t, ratio_t, hf_t)
 
         if record_debug:
@@ -254,6 +267,9 @@ class FallTracker:
 
         if up:
             self.last_upright_t = now
+
+        if (now - self._start_time) < self.STARTUP_GRACE:
+            return None
 
         event = None
 
@@ -271,6 +287,9 @@ class FallTracker:
                     self.state = 'fallen'
             elif up:
                 self.state = 'unknown'
+            else:
+                if (now - self.fall_start_t) > self.POTENTIAL_FALL_TIMEOUT:
+                    self.state = 'unknown'
 
         elif self.state == 'fallen':
             if up:
