@@ -9,7 +9,12 @@ Tuning:
 """
 
 import time
+import websocket
+import json
 import argparse
+import io
+import csv
+import urllib.request
 from collections import deque
 import math
 import threading
@@ -30,6 +35,59 @@ HEAD_IDX = np.array([0,1,2,3,4])
 FEET_IDX = np.array([15,16])
 BODY_IDX = np.array([0,5,6,11,12,13,14,15,16])
 LS, RS, LH, RH = 5, 6, 11, 12
+
+# Upper body: head keypoints + shoulders + elbows + wrists
+# Lower body: hips + knees + ankles
+UPPER_BODY_IDX = np.array([0,1,2,3,4, 5,6, 7,8, 9,10])
+LOWER_BODY_IDX = np.array([11,12, 13,14, 15,16])
+
+# WebSocket state (shared between ws thread and main loop)
+class SocketState:
+    HINT_TTL = 15.0  # seconds a fall hint from the phone stays relevant
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.connected = False
+        self.last_result = None    # 'fall', 'no_fall', 'error'
+        self.last_msg_t = None     # timestamp of last result
+        self._ws = None
+
+    def set_ws(self, ws):
+        with self._lock:
+            self._ws = ws
+
+    def set_connected(self, val):
+        with self._lock:
+            self.connected = val
+
+    def set_result(self, result):
+        with self._lock:
+            self.last_result = result
+            self.last_msg_t = time.time()
+
+    def send(self, msg):
+        with self._lock:
+            ws = self._ws
+        if ws:
+            try:
+                ws.send(msg)
+            except Exception:
+                pass
+
+    def snapshot(self):
+        with self._lock:
+            now = time.time()
+            hint = (
+                self.last_result == 'fall'
+                and self.last_msg_t is not None
+                and (now - self.last_msg_t) < self.HINT_TTL
+            )
+            return {
+                'connected': self.connected,
+                'last_result': self.last_result,
+                'last_msg_t': self.last_msg_t,
+                'hint': hint,
+            }
 
 
 # Camera capture
@@ -117,23 +175,26 @@ class PoseModel:
 
 
 # Feature extraction
-def find_features(kps, thresh=0.3):
+def find_features(kps, thresh=0.4):
     """
     Extract features from the keypoints with shape:
         (17, 3) as [y, x, confidence]
+
     Returns:
         dict: A dict of pose metrics:
-            -torso_angle (float): Angle of torso from vertical (degrees).
-            -head_feet_angle (float): Angle between head and feet.
-            -aspect_ratio (float): Bounding box width/height ratio.
-            -center_y (float): Y coordinate of bbox center (0-1).
-            -normalized_cy (float): Y relative to bbox (0=top, 1=bottom).
-            -bbox_height/width (float): Dimensions (0-1).
-            -ankle_visible (bool): True if at least one ankle is seen.
-            -keypoint_count (int): Count above confidence threshold.
-            -shoulder/hip_conf (float): Minimum confidence scores.
-            -bbox (tuple): (x_min, y_min, x_max, y_max) coordinates.
-        None: If core keypoints are missing or too few.
+            -torso_angle (float): Angle of torso from vertical (degrees)
+            -head_feet_angle (float): Angle between head and feet
+            -aspect_ratio (float): Bounding box width/height ratio
+            -body_y_diff (float): Y difference between upper and lower body
+            -body_x_spread (float): X spread between upper and lower body
+            -center_y (float): Y coordinate of bbox center (0-1)
+            -normalized_cy (float): Y relative to bbox (0=top, 1=bottom)
+            -bbox_height/width (float): Dimensions (0-1)
+            -ankle_visible (bool): True if at least one ankle is seen
+            -keypoint_count (int): Count above confidence threshold
+            -shoulder/hip_conf (float): Minimum confidence scores
+            -bbox (tuple): (x_min, y_min, x_max, y_max) coordinates
+        None: If core keypoints are missing or too few
     """
     confs = kps[:, 2]
 
@@ -153,10 +214,26 @@ def find_features(kps, thresh=0.3):
     head_feet_angle = None
 
     if head_mask.any() and feet_mask.any():
-        head_avg = kps[HEAD_IDX[head_mask], :2].mean(axis=0)  # [y, x]
+        head_avg = kps[HEAD_IDX[head_mask], :2].mean(axis=0)  
         feet_avg = kps[FEET_IDX[feet_mask], :2].mean(axis=0)
         hf_d = head_avg - feet_avg
         head_feet_angle = math.degrees(math.atan2(abs(hf_d[1]), abs(hf_d[0]) + 1e-6))
+
+    # Upper-body vs lower-body comparison to catch horizontal poses
+    upper_mask = confs[UPPER_BODY_IDX] > thresh
+    lower_mask = confs[LOWER_BODY_IDX] > thresh
+    body_y_diff = None
+    body_x_spread = None
+
+    if upper_mask.sum() >= 2 and lower_mask.sum() >= 2:
+        upper_pts = kps[UPPER_BODY_IDX[upper_mask], :2]  
+        lower_pts = kps[LOWER_BODY_IDX[lower_mask], :2]
+        # Average Y of upper body vs lower body
+        # Small difference = body is horizontal
+        body_y_diff = abs(float(upper_pts[:, 0].mean() - lower_pts[:, 0].mean()))
+        # X spread = how far apart upper and lower body are horizontally
+        # Large spread = body is stretched out sideways
+        body_x_spread = abs(float(upper_pts[:, 1].mean() - lower_pts[:, 1].mean()))
 
     # Bounding box from all visible keypoints 
     visible = confs >= thresh
@@ -182,6 +259,8 @@ def find_features(kps, thresh=0.3):
         'torso_angle': torso_angle,
         'head_feet_angle': head_feet_angle,
         'aspect_ratio': float(aspect_ratio),
+        'body_y_diff': body_y_diff,
+        'body_x_spread': body_x_spread,
         'center_y': float(center_y),
         'normalized_cy': float(norm_cy),
         'bbox_height': float(bbox_h),
@@ -201,12 +280,18 @@ def is_upright(f, torso_t=35, ratio_t=1.0):
 def is_fallen(f, torso_t=50, ratio_t=1.0, hf_t=55):
     if f['torso_angle'] > torso_t and f['aspect_ratio'] > ratio_t:
         return True
+
     if f.get('head_feet_angle') is not None and f['head_feet_angle'] > hf_t:
         return True
+
     if f['aspect_ratio'] > 1.8:
         return True
-    return False
 
+    if f.get('body_y_diff') is not None and f.get('body_x_spread') is not None:
+        if f['body_y_diff'] <= 0.08 and f['body_x_spread'] > 0.3:
+            return True
+
+    return False
 
 # Fall state tracker
 class FallTracker:
@@ -216,7 +301,7 @@ class FallTracker:
     # Max time to stay in potential_fall without confirming
     POTENTIAL_FALL_TIMEOUT = 5.0
 
-    def __init__(self, confirm_time=1.5, cooldown=5.0):
+    def __init__(self, confirm_time=1.5, cooldown=5.0, startup_grace=None):
         self.state = 'unknown'
         self.last_upright_t = time.time()
         self.fall_start_t = 0.0
@@ -228,13 +313,14 @@ class FallTracker:
         self.frames_missing = 0
         self._first_detection = True
         self._start_time = time.time()
+        self._startup_grace = self.STARTUP_GRACE if startup_grace is None else startup_grace
 
         # Debug histories
         self.torso_hist = deque(maxlen=90)
         self.ratio_hist = deque(maxlen=90)
         self.hf_hist = deque(maxlen=90)
 
-    def update(self, feat, now, torso_t, ratio_t, hf_t, transition_t=1.5, record_debug=False):
+    def update(self, feat, now, torso_t, ratio_t, hf_t, transition_t=1.5, record_debug=False, ws_hint=False):
         if feat is None:
             self.frames_missing += 1
             # Reset potential_fall if tracking lost
@@ -268,7 +354,7 @@ class FallTracker:
         if up:
             self.last_upright_t = now
 
-        if (now - self._start_time) < self.STARTUP_GRACE:
+        if (now - self._start_time) < self._startup_grace:
             return None
 
         event = None
@@ -279,8 +365,10 @@ class FallTracker:
                 self.fall_start_t = now
 
         elif self.state == 'potential_fall':
+            # ws_hint reduces confirm time by 40% (lower weight secondary metric)
+            effective_confirm = self.confirm_time * (0.6 if ws_hint else 1.0)
             if fell:
-                if (now - self.fall_start_t) > self.confirm_time:
+                if (now - self.fall_start_t) > effective_confirm:
                     if (now - self.last_alert_t) > self.cooldown:
                         self.last_alert_t = now
                         event = 'fall'
@@ -301,7 +389,7 @@ class FallTracker:
 
 
 # Drawing 
-def draw_skeleton(frame, kps, thresh=0.3):
+def draw_skeleton(frame, kps, thresh=0.4):
     """Draw skeleton and keypoints on the frame
     Args:
         -frame: The image frame to draw on (BGR format).
@@ -333,7 +421,7 @@ def draw_bbox(frame, feat):
     cv2.rectangle(frame, (int(x0*w), int(y0*h)), (int(x1*w), int(y1*h)), SKELETON_COLOR, 1)
 
 
-def draw_debug(frame, tracker, thresholds):
+def draw_debug(frame, tracker, thresholds, socket_state=None):
     """Render debug info into a separate side panel and return it."""
     h = frame.shape[0]
     pw = 260
@@ -380,6 +468,16 @@ def draw_debug(frame, tracker, thresholds):
         val_line("Head-Feet", hf, ht)
 
     val_line("Ratio", feat['aspect_ratio'], rt, ".2f")
+
+    # Upper and lower body comparison
+    yd = feat.get('body_y_diff')
+    xs = feat.get('body_x_spread')
+    if yd is not None and xs is not None:
+        # Show as inverted bar --> lower y_diff = more horizontal = more red
+        y_diff_alert = yd <= 0.08 and xs > 0.3
+        c = (0,0,255) if y_diff_alert else (0,255,0)
+        cv2.putText(panel, f"UB-LB dy:{yd:.3f} dx:{xs:.3f}", (x, y), F, 0.35, c, 1)
+        y += 18
 
     y += 5
     cv2.putText(panel, f"keypoints: {feat['keypoint_count']}/17  "
@@ -431,7 +529,133 @@ def draw_debug(frame, tracker, thresholds):
     mini_graph("ratio", tracker.ratio_hist, 0, 3, rt, (255,200,0))
     mini_graph("hd-ft", tracker.hf_hist, 0, 90, ht, (200,0,255))
 
+    # Socket status section
+    if socket_state is not None:
+        y += 6
+        cv2.line(panel, (x, y), (x + pw - 10, y), (60, 60, 60), 1)
+        y += 10
+        snap = socket_state.snapshot()
+        conn_c = (0, 255, 0) if snap['connected'] else (80, 80, 80)
+        conn_txt = "WS: CONNECTED" if snap['connected'] else "WS: DISCONNECTED"
+        cv2.putText(panel, conn_txt, (x, y), F, 0.38, conn_c, 1)
+        y += 16
+
+        res = snap['last_result']
+        if res is None:
+            res_txt = "Phone: --"
+            res_c = G
+        else:
+            ago = time.time() - snap['last_msg_t']
+            res_txt = f"Phone: {res}  ({ago:.0f}s ago)"
+            res_c = (0, 0, 255) if res == 'fall' else (0, 200, 100)
+        cv2.putText(panel, res_txt, (x, y), F, 0.38, res_c, 1)
+        y += 16
+
+        hint_c = (0, 165, 255) if snap['hint'] else G
+        hint_txt = f"Hint: ACTIVE (confirm -40%)" if snap['hint'] else "Hint: inactive"
+        cv2.putText(panel, hint_txt, (x, y), F, 0.35, hint_c, 1)
+        y += 16
+
     return panel
+
+
+# WebSocket background thread
+def start_ws_background(args, socket_state, cam_tracker):
+    """Start a WebSocket client in a daemon thread.
+
+    Receives CSV URLs from the phone, runs fall detection on them as a soft hint,
+    then replies with what the camera model is currently detecting.
+    """
+
+    def on_open(ws):
+        socket_state.set_connected(True)
+        socket_state.set_ws(ws)
+        print("[WS] Connected")
+
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            print("[WS] Invalid JSON received")
+            return
+        url = data.get('data')
+        if not url:
+            return
+        print(f"[WS] Received CSV URL: {url}")
+        # Process CSV as a hint for the camera tracker
+        try:
+            phone_result = process_csv(url, args)
+        except Exception as e:
+            print(f"[WS] Error processing CSV: {e}")
+            phone_result = 'error'
+        print(f"[WS] Phone analysis: {phone_result}")
+        socket_state.set_result(phone_result)
+
+        # Reply with what the camera model is currently detecting
+        cam_fallen = cam_tracker.state in ('fallen', 'potential_fall')
+        camera_result = 'fall' if cam_fallen else 'no_fall'
+        print(f"[WS] Camera status: {camera_result}")
+        ws.send(json.dumps({'target': 'phone', 'data': camera_result}))
+
+    def on_error(_ws, error):
+        print(f"[WS] Error: {error}")
+
+    def on_close(_ws, _code, _msg):
+        socket_state.set_connected(False)
+        socket_state.set_ws(None)
+        print("[WS] Disconnected")
+
+    def _run():
+        ws = websocket.WebSocketApp(
+            args.ws_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        ws.run_forever(reconnect=5)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
+
+
+# CSV processing (used by ws background thread)
+def process_csv(url, args):
+    """Download a CSV of keypoints and run fall detection.
+
+    Expected format: one row per frame, 51 columns [y0,x0,c0, y1,x1,c1, ..., y16,x16,c16].
+    Returns 'fall' if a fall event is detected otherwise 'no_fall'
+    """
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        content = resp.read().decode('utf-8')
+
+    reader = csv.reader(io.StringIO(content))
+    # startup_grace=0: no warm-up silence for offline clips
+    tracker = FallTracker(confirm_time=args.confirm_time, startup_grace=0.0)
+    result = 'no_fall'
+    now = time.time()
+
+    for row in reader:
+        if len(row) < 51:
+            continue
+        try:
+            vals = [float(v) for v in row[:51]]
+        except ValueError:
+            continue  # skip header or malformed rows
+
+        kps = np.array(vals, dtype=np.float32).reshape(17, 3)
+        features = find_features(kps, args.score_thresh)
+        # transition_t=9999: don't require prior upright state — clip may start mid-fall
+        ev = tracker.update(features, now, args.torso_thresh, args.ratio_thresh, args.hf_thresh,
+                            transition_t=9999)
+        now += 0.033  # simulate ~30 fps timestamps
+        if ev == 'fall':
+            result = 'fall'
+            break
+
+    return result
+
 
 
 # Main
@@ -454,10 +678,20 @@ Examples:
     parser.add_argument("--ratio-thresh", type=float, default=1.0)
     parser.add_argument("--hf-thresh", type=float, default=55)
     parser.add_argument("--confirm-time", type=float, default=1.5)
-    parser.add_argument("--score-thresh", type=float, default=0.3)
+    parser.add_argument("--score-thresh", type=float, default=0.4, help="Keypoint confidence threshold (0.4 recommended for Lightning, Alam et al. used 0.5 for Thunder)")
+    parser.add_argument("--ws", action="store_true", help="Run in WebSocket hub mode (receive CSV, process, reply)")
+    parser.add_argument("--ws-url", default="wss://1327-68-148-232-205.ngrok-free.app/ws?id=hub", help="WebSocket endpoint URL")
     args = parser.parse_args()
 
     thresholds = {'torso': args.torso_thresh, 'ratio': args.ratio_thresh, 'hf': args.hf_thresh}
+
+    tracker = FallTracker(confirm_time=args.confirm_time)
+
+    socket_state = None
+    if args.ws:
+        socket_state = SocketState()
+        print(f"[WS] Connecting to {args.ws_url} in background ...")
+        start_ws_background(args, socket_state, tracker)
 
     print("=" * 50)
     print("  Fall Detection System ")
@@ -465,6 +699,7 @@ Examples:
     model = PoseModel(args.model)
     print(f"  Camera: {args.camera} | Skip: every {args.skip_frames} frame(s)")
     print(f"  Thresholds: torso>{args.torso_thresh} ratio>{args.ratio_thresh} hf>{args.hf_thresh}")
+    print(f"  Confidence: {args.score_thresh}")
     print(f"  Debug: {'ON' if args.debug else 'OFF (press d to toggle)'}")
     print(f"  Press 'q' to quit, 'd' to toggle debug\n")
 
@@ -474,8 +709,6 @@ Examples:
 
     # Wait for first frame
     time.sleep(0.5)
-
-    tracker = FallTracker(confirm_time=args.confirm_time)
     show_debug = args.debug
 
     fps_time = time.time()
@@ -507,11 +740,15 @@ Examples:
 
             last_feat = find_features(last_kps, args.score_thresh)
 
+            ws_snap = socket_state.snapshot() if socket_state else None
+            ws_hint = ws_snap['hint'] if ws_snap else False
             ev = tracker.update(last_feat, now, args.torso_thresh,
                                 args.ratio_thresh, args.hf_thresh,
-                                record_debug=show_debug)
+                                record_debug=show_debug, ws_hint=ws_hint)
             if ev == 'fall':
                 print(f"[{time.strftime('%H:%M:%S')}] FALL DETECTED")
+                if socket_state:
+                    socket_state.send(json.dumps({'target': 'phone', 'data': 'camera_fall'}))
             elif ev == 'recovered':
                 print(f"[{time.strftime('%H:%M:%S')}] Person recovered")
 
@@ -522,9 +759,11 @@ Examples:
                 if last_feat:
                     hf = last_feat.get('head_feet_angle')
                     hs = f"{hf:.0f}" if hf else "?"
+                    yd = last_feat.get('body_y_diff')
+                    yds = f"{yd:.3f}" if yd is not None else "?"
                     print(f"[{time.strftime('%H:%M:%S')}] {tracker.state} | "
                           f"torso={last_feat['torso_angle']:.0f} hf={hs} "
-                          f"ratio={last_feat['aspect_ratio']:.1f} | {inf_ms:.0f}ms")
+                          f"ratio={last_feat['aspect_ratio']:.1f} dy={yds} | {inf_ms:.0f}ms")
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] No body detected | {inf_ms:.0f}ms")
             time.sleep(0.01)
@@ -571,7 +810,7 @@ Examples:
 
         # Debug panel
         if show_debug:
-            debug_panel = draw_debug(frame, tracker, thresholds)
+            debug_panel = draw_debug(frame, tracker, thresholds, socket_state)
             display = np.hstack([frame, debug_panel])
         else:
             display = frame
