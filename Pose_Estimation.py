@@ -45,12 +45,16 @@ LOWER_BODY_IDX = np.array([11,12, 13,14, 15,16])
 class SocketState:
     HINT_TTL = 15.0  # seconds a fall hint from the phone stays relevant
 
+    CSV_PREVIEW_LINES = 4  # how many CSV rows to show in debug panel
+
     def __init__(self):
         self._lock = threading.Lock()
         self.connected = False
         self.last_result = None    # 'fall', 'no_fall', 'error'
         self.last_msg_t = None     # timestamp of last result
         self._ws = None
+        self.csv_preview = []      # last few CSV rows for debug display
+        self.csv_url = None        # last CSV URL received
 
     def set_ws(self, ws):
         with self._lock:
@@ -59,6 +63,11 @@ class SocketState:
     def set_connected(self, val):
         with self._lock:
             self.connected = val
+
+    def set_csv_preview(self, url, rows):
+        with self._lock:
+            self.csv_url = url
+            self.csv_preview = rows[:self.CSV_PREVIEW_LINES]
 
     def set_result(self, result):
         with self._lock:
@@ -87,6 +96,8 @@ class SocketState:
                 'last_result': self.last_result,
                 'last_msg_t': self.last_msg_t,
                 'hint': hint,
+                'csv_url': self.csv_url,
+                'csv_preview': list(self.csv_preview),
             }
 
 
@@ -96,11 +107,21 @@ class CameraStream:
     Read frames in a background thread so the main loop never waits
     """
 
-    def __init__(self, src=0, width=640, height=480):
+    def __init__(self, src=0, width=640, height=480, auto_exposure=False):
         self.cap = cv2.VideoCapture(src)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Lock camera settings for consistency
+        if not auto_exposure:
+            # V4L2: 1=manual, 3=auto
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            self.cap.set(cv2.CAP_PROP_EXPOSURE, 150)
+            self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+            self.cap.set(cv2.CAP_PROP_GAIN, 0)
+            print(f"  Camera: manual exposure={self.cap.get(cv2.CAP_PROP_EXPOSURE):.0f}, "
+                  f"gain={self.cap.get(cv2.CAP_PROP_GAIN):.0f}, auto_wb=off")
         self.ret = False
         self.frame = None
         self.lock = threading.Lock()
@@ -198,13 +219,30 @@ def find_features(kps, thresh=0.4):
     """
     confs = kps[:, 2]
 
-    # Check core keypoints: both shoulders, both hips
-    if confs[LS] < thresh or confs[RS] < thresh or confs[LH] < thresh or confs[RH] < thresh:
+    # Need at least one shoulder and one hip
+    has_ls = confs[LS] >= thresh
+    has_rs = confs[RS] >= thresh
+    has_lh = confs[LH] >= thresh
+    has_rh = confs[RH] >= thresh
+
+    if not (has_ls or has_rs) or not (has_lh or has_rh):
         return None
 
-    # Torso angle
-    sh_mid = (kps[LS, :2] + kps[RS, :2]) / 2   # shoulder midpoint [y, x]
-    hip_mid = (kps[LH, :2] + kps[RH, :2]) / 2  # hip midpoint [y, x]
+    # Shoulder midpoint: use both if available, else the visible one
+    if has_ls and has_rs:
+        sh_mid = (kps[LS, :2] + kps[RS, :2]) / 2
+    elif has_ls:
+        sh_mid = kps[LS, :2].copy()
+    else:
+        sh_mid = kps[RS, :2].copy()
+
+    # Hip midpoint: same logic
+    if has_lh and has_rh:
+        hip_mid = (kps[LH, :2] + kps[RH, :2]) / 2
+    elif has_lh:
+        hip_mid = kps[LH, :2].copy()
+    else:
+        hip_mid = kps[RH, :2].copy()
     delta = hip_mid - sh_mid                     # [dy, dx]
     torso_angle = math.degrees(math.atan2(abs(delta[1]), abs(delta[0]) + 1e-6))
 
@@ -238,7 +276,7 @@ def find_features(kps, thresh=0.4):
     # Bounding box from all visible keypoints 
     visible = confs >= thresh
     kp_count = visible.sum()
-    if kp_count < 5:
+    if kp_count < 3:
         return None
 
     vis_pts = kps[visible, :2]  # shape (N, 2) as [y, x]
@@ -267,8 +305,8 @@ def find_features(kps, thresh=0.4):
         'bbox_width': float(bbox_w),
         'ankle_visible': ankle_visible,
         'keypoint_count': int(kp_count),
-        'shoulder_conf': float(min(confs[LS], confs[RS])),
-        'hip_conf': float(min(confs[LH], confs[RH])),
+        'shoulder_conf': float(min(confs[LS], confs[RS]) if (has_ls and has_rs) else max(confs[LS], confs[RS])),
+        'hip_conf': float(min(confs[LH], confs[RH]) if (has_lh and has_rh) else max(confs[LH], confs[RH])),
         'bbox': (float(x_min), float(y_min), float(x_max), float(y_max)),
     }
 
@@ -324,9 +362,9 @@ class FallTracker:
         if feat is None:
             self.frames_missing += 1
             # Reset potential_fall if tracking lost
-            if self.frames_missing > 15 and self.state == 'potential_fall':
+            if self.frames_missing > 30 and self.state == 'potential_fall':
                 self.state = 'unknown'
-            if self.frames_missing > 90 and self.state == 'fallen':
+            if self.frames_missing > 120 and self.state == 'fallen':
                 self.state = 'unknown'
             return None
 
@@ -556,6 +594,21 @@ def draw_debug(frame, tracker, thresholds, socket_state=None):
         cv2.putText(panel, hint_txt, (x, y), F, 0.35, hint_c, 1)
         y += 16
 
+        # CSV preview
+        csv_rows = snap.get('csv_preview', [])
+        if csv_rows:
+            y += 4
+            csv_url = snap.get('csv_url', '')
+            # Show truncated URL
+            url_short = csv_url[-35:] if len(csv_url) > 35 else csv_url
+            cv2.putText(panel, f"CSV: ...{url_short}", (x, y), F, 0.28, (180, 180, 100), 1)
+            y += 13
+            for i, row in enumerate(csv_rows):
+                # Truncate long rows to fit panel
+                display_row = row[:50] + "..." if len(row) > 50 else row
+                cv2.putText(panel, f"{i}: {display_row}", (x, y), F, 0.28, (140, 140, 140), 1)
+                y += 11
+
     return panel
 
 
@@ -582,9 +635,21 @@ def start_ws_background(args, socket_state, cam_tracker):
         if not url:
             return
         print(f"[WS] Received CSV URL: {url}")
-        # Process CSV as a hint for the camera tracker
+        # Fetch CSV once, grab preview rows, then process
         try:
-            phone_result = process_csv(url, args)
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                csv_content = resp.read().decode('utf-8')
+        except Exception as e:
+            print(f"[WS] Error fetching CSV: {e}")
+            socket_state.set_result('error')
+            return
+
+        # Store first few rows as preview for debug panel
+        preview_rows = csv_content.splitlines()[:SocketState.CSV_PREVIEW_LINES]
+        socket_state.set_csv_preview(url, preview_rows)
+
+        try:
+            phone_result = process_csv(csv_content, args, raw=True)
         except Exception as e:
             print(f"[WS] Error processing CSV: {e}")
             phone_result = 'error'
@@ -621,14 +686,18 @@ def start_ws_background(args, socket_state, cam_tracker):
 
 
 # CSV processing (used by ws background thread)
-def process_csv(url, args):
-    """Download a CSV of keypoints and run fall detection.
+def process_csv(url_or_content, args, raw=False):
+    """Process a CSV of keypoints and run fall detection.
 
     Expected format: one row per frame, 51 columns [y0,x0,c0, y1,x1,c1, ..., y16,x16,c16].
+    If raw=True, url_or_content is the CSV string directly. Otherwise it's a URL to fetch.
     Returns 'fall' if a fall event is detected otherwise 'no_fall'
     """
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        content = resp.read().decode('utf-8')
+    if raw:
+        content = url_or_content
+    else:
+        with urllib.request.urlopen(url_or_content, timeout=15) as resp:
+            content = resp.read().decode('utf-8')
 
     reader = csv.reader(io.StringIO(content))
     # startup_grace=0: no warm-up silence for offline clips
@@ -679,6 +748,7 @@ Examples:
     parser.add_argument("--hf-thresh", type=float, default=55)
     parser.add_argument("--confirm-time", type=float, default=1.5)
     parser.add_argument("--score-thresh", type=float, default=0.4, help="Keypoint confidence threshold (0.4 recommended for Lightning, Alam et al. used 0.5 for Thunder)")
+    parser.add_argument("--auto-exposure", action="store_true", help="Let camera auto-adjust exposure (default: locked manual)")
     parser.add_argument("--ws", action="store_true", help="Run in WebSocket hub mode (receive CSV, process, reply)")
     parser.add_argument("--ws-url", default="wss://1327-68-148-232-205.ngrok-free.app/ws?id=hub", help="WebSocket endpoint URL")
     args = parser.parse_args()
@@ -703,7 +773,7 @@ Examples:
     print(f"  Debug: {'ON' if args.debug else 'OFF (press d to toggle)'}")
     print(f"  Press 'q' to quit, 'd' to toggle debug\n")
 
-    cam = CameraStream(args.camera)
+    cam = CameraStream(args.camera, auto_exposure=args.auto_exposure)
     if not cam.is_opened():
         raise RuntimeError("Cannot open camera")
 
