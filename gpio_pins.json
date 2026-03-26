@@ -1,0 +1,6 @@
+{
+  "buzzer": 17,
+  "red_led": 23,
+  "green_led": 25,
+  "blue_led": 24
+}

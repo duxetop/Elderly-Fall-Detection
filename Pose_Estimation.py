@@ -4,11 +4,15 @@ Usage:
   python Pose_Estimation.py --skip-frames 2  # run model every 2nd frame; can do more at the cost of lag
 
 Tuning:
-  Threshold tuning example to increase sensitivity: python Pose_Estimation.py --torso-thresh 45 --ratio-thresh 0.9 --hf-thresh 50 
+  Threshold tuning example to increase sensitivity: python Pose_Estimation.py --torso-thresh 45 --ratio-thresh 0.9 --hf-thresh 50
+  Angled camera (e.g. 15° clockwise tilt): python Pose_Estimation.py --camera-tilt 15
+  High camera (e.g. mounted at 30° above horizontal): python Pose_Estimation.py --camera-elevation 30
 
 """
 
 import time
+import socket as _socket
+import os
 import websocket
 import json
 import argparse
@@ -99,6 +103,91 @@ class SocketState:
                 'csv_url': self.csv_url,
                 'csv_preview': list(self.csv_preview),
             }
+
+
+# IPC server for peripheral controller
+class IPCServer:
+    """Unix domain socket server for peripheral controller communication.
+    """
+
+    def __init__(self, sock_path='/tmp/falldetect.sock'):
+        self.sock_path = sock_path
+        self._lock = threading.Lock()
+        self._client = None
+        self._server = None
+        self._running = False
+        self._on_command = lambda msg: None
+
+    def start(self):
+        if os.path.exists(self.sock_path):
+            os.unlink(self.sock_path)
+        self._server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        self._server.bind(self.sock_path)
+        self._server.listen(1)
+        self._server.settimeout(1.0)
+        self._running = True
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while self._running:
+            try:
+                client, _ = self._server.accept()
+            except OSError:
+                continue
+            with self._lock:
+                if self._client:
+                    try:
+                        self._client.close()
+                    except Exception:
+                        pass
+                self._client = client
+            print("[IPC] Peripheral controller connected")
+            threading.Thread(target=self._recv_loop, args=(client,), daemon=True).start()
+
+    def _recv_loop(self, client):
+        buf = b''
+        while self._running:
+            try:
+                data = client.recv(4096)
+                if not data:
+                    break
+                buf += data
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    try:
+                        self._on_command(json.loads(line.decode()))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+            except Exception:
+                break
+        with self._lock:
+            if self._client is client:
+                self._client = None
+        print("[IPC] Peripheral controller disconnected")
+
+    def set_command_callback(self, cb):
+        self._on_command = cb
+
+    def send(self, msg_dict):
+        with self._lock:
+            client = self._client
+        if client:
+            try:
+                client.sendall((json.dumps(msg_dict) + '\n').encode())
+            except Exception:
+                with self._lock:
+                    self._client = None
+
+    def stop(self):
+        self._running = False
+        try:
+            self._server.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(self.sock_path)
+        except Exception:
+            pass
 
 
 # Camera capture
@@ -309,6 +398,47 @@ def find_features(kps, thresh=0.4):
         'hip_conf': float(min(confs[LH], confs[RH]) if (has_lh and has_rh) else max(confs[LH], confs[RH])),
         'bbox': (float(x_min), float(y_min), float(x_max), float(y_max)),
     }
+
+
+def apply_tilt_correction(kps, tilt_deg):
+    """Rotate keypoints to compensate for a tilted camera
+
+    Args:
+        kps: (17, 3) array of [y, x, confidence] in normalised [0,1] coords.
+        tilt_deg: camera tilt in degrees; positive = camera rotated clockwise.
+    Returns:
+        corrected copy of kps (17, 3) — confidences unchanged.
+    """
+    if tilt_deg == 0.0:
+        return kps
+    theta = math.radians(-tilt_deg)   # counterclockwise compensation
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    corrected = kps.copy()
+    dy = kps[:, 0] - 0.5              # y relative to image centre
+    dx = kps[:, 1] - 0.5              # x relative to image centre
+    corrected[:, 0] = 0.5 + dy * cos_t - dx * sin_t
+    corrected[:, 1] = 0.5 + dx * cos_t + dy * sin_t
+    return corrected
+
+
+def apply_elevation_correction(kps, elev_deg):
+    """Stretch keypoint Y-coordinates to compensate for an elevated camera
+
+    Args:
+        kps: (17, 3) array of [y, x, confidence] in normalised [0,1] coords.
+        elev_deg: camera elevation in degrees above horizontal (0=horizontal,
+                  90=straight down). Values outside [5, 85] are clamped to
+                  avoid division by ~zero.
+    Returns:
+        corrected copy of kps (17, 3) — confidences unchanged.
+    """
+    if elev_deg == 0.0:
+        return kps
+    elev_rad = math.radians(max(5.0, min(85.0, elev_deg)))
+    scale_y = 1.0 / math.sin(elev_rad)
+    corrected = kps.copy()
+    corrected[:, 0] = 0.5 + (kps[:, 0] - 0.5) * scale_y
+    return corrected
 
 
 def is_upright(f, torso_t=35, ratio_t=1.0):
@@ -714,6 +844,8 @@ def process_csv(url_or_content, args, raw=False):
             continue  # skip header or malformed rows
 
         kps = np.array(vals, dtype=np.float32).reshape(17, 3)
+        kps = apply_tilt_correction(kps, getattr(args, 'camera_tilt', 0.0))
+        kps = apply_elevation_correction(kps, getattr(args, 'camera_elevation', 0.0))
         features = find_features(kps, args.score_thresh)
         # transition_t=9999: don't require prior upright state — clip may start mid-fall
         ev = tracker.update(features, now, args.torso_thresh, args.ratio_thresh, args.hf_thresh,
@@ -748,7 +880,17 @@ Examples:
     parser.add_argument("--hf-thresh", type=float, default=55)
     parser.add_argument("--confirm-time", type=float, default=1.5)
     parser.add_argument("--score-thresh", type=float, default=0.4, help="Keypoint confidence threshold (0.4 recommended for Lightning, Alam et al. used 0.5 for Thunder)")
+    parser.add_argument("--camera-tilt", type=float, default=0.0,
+                        help="Camera rotation in degrees (positive=clockwise). "
+                             "Keypoints are counter-rotated before feature extraction "
+                             "so a tilted camera does not bias angle metrics.")
+    parser.add_argument("--camera-elevation", type=float, default=0.0,
+                        help="Camera elevation in degrees above horizontal (0=eye-level, 90=straight down). "
+                             "Keypoint Y-coordinates are stretched by 1/sin(elev) to undo the "
+                             "vertical foreshortening caused by a high-mounted camera.")
     parser.add_argument("--auto-exposure", action="store_true", help="Let camera auto-adjust exposure (default: locked manual)")
+    parser.add_argument("--ipc", action="store_true", help="Enable IPC server for peripheral controller")
+    parser.add_argument("--ipc-sock", default="/tmp/falldetect.sock", help="Unix socket path for IPC")
     parser.add_argument("--ws", action="store_true", help="Run in WebSocket hub mode (receive CSV, process, reply)")
     parser.add_argument("--ws-url", default="wss://1327-68-148-232-205.ngrok-free.app/ws?id=hub", help="WebSocket endpoint URL")
     args = parser.parse_args()
@@ -756,6 +898,19 @@ Examples:
     thresholds = {'torso': args.torso_thresh, 'ratio': args.ratio_thresh, 'hf': args.hf_thresh}
 
     tracker = FallTracker(confirm_time=args.confirm_time)
+
+    ipc = None
+    if args.ipc:
+        ipc = IPCServer(args.ipc_sock)
+        def on_ipc_command(msg):
+            cmd = msg.get('cmd')
+            if cmd == 'reset_fall':
+                tracker.state = 'unknown'
+                tracker.cy_history.clear()
+                print(f"[IPC] Fall state reset by peripheral controller")
+        ipc.set_command_callback(on_ipc_command)
+        ipc.start()
+        print(f"[IPC] Listening on {args.ipc_sock}")
 
     socket_state = None
     if args.ws:
@@ -808,7 +963,10 @@ Examples:
             last_kps = model.run(frame)
             inf_ms = (time.time() - t0) * 1000
 
-            last_feat = find_features(last_kps, args.score_thresh)
+            # Corrected copy for feature extraction --> last_kps stays raw for drawing
+            kps_for_feat = apply_tilt_correction(last_kps, args.camera_tilt)
+            kps_for_feat = apply_elevation_correction(kps_for_feat, args.camera_elevation)
+            last_feat = find_features(kps_for_feat, args.score_thresh)
 
             ws_snap = socket_state.snapshot() if socket_state else None
             ws_hint = ws_snap['hint'] if ws_snap else False
@@ -817,12 +975,20 @@ Examples:
                                 record_debug=show_debug, ws_hint=ws_hint)
             if ev == 'fall':
                 print(f"[{time.strftime('%H:%M:%S')}] FALL DETECTED")
+                if ipc:
+                    ipc.send({'type': 'event', 'event': 'fall_detected', 'ts': now})
                 if socket_state:
                     socket_state.send(json.dumps({'target': 'phone', 'data': 'camera_fall'}))
             elif ev == 'recovered':
                 print(f"[{time.strftime('%H:%M:%S')}] Person recovered")
+                if ipc:
+                    ipc.send({'type': 'event', 'event': 'recovered', 'ts': now})
 
-        # Headless mode 
+            # IPC status heartbeat ~every 2s at 30fps
+            if ipc and frame_num % 60 == 0:
+                ipc.send({'type': 'status', 'state': tracker.state, 'ts': now})
+
+        # Headless mode
         if args.headless:
             if run_now and frame_num % 30 == 0:
                 # Print periodic status
@@ -894,6 +1060,8 @@ Examples:
             print(f"Debug: {'ON' if show_debug else 'OFF'}")
 
     cam.release()
+    if ipc:
+        ipc.stop()
     cv2.destroyAllWindows()
 
 
