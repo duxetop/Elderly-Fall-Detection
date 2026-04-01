@@ -193,14 +193,21 @@ class VoiceListener:
     """
 
     COMMANDS = {
-        'stop buzzer':  'stop_buzzer',
-        'stop alarm':   'stop_buzzer',
-        'stop':         'stop_buzzer',
-        'reset fall':   'reset_fall',
-        'reset':        'reset_fall',
-        'send alert':   'send_alert',
-        'call help':    'send_alert',
-        'help':         'send_alert',
+        'stop buzzer':   'stop_buzzer',
+        'stop alarm':    'stop_buzzer',
+        'stop':          'stop_buzzer',
+        'reset fall':    'reset_fall',
+        'reset':         'reset_fall',
+        'send alert':    'send_alert',
+        'call help':     'send_alert',
+        'help':          'send_alert',
+        'take photo':    'send_photo',
+        'send photo':    'send_photo',
+        'send picture':  'send_photo',
+        'take picture':  'send_photo',
+        'cancel alert':  'cancel_alert',
+        'false alarm':   'cancel_alert',
+        'cancel':        'cancel_alert',
     }
 
     def __init__(self, model_path, on_command_cb, device=None, sample_rate=16000):
@@ -235,14 +242,15 @@ class VoiceListener:
             print("[VOICE] sounddevice not installed, voice disabled")
             return
 
-        # Detect hardware sample rate 
+        # Detect hardware sample rate (works for both explicit device and default)
         hw_rate = self.sample_rate
-        if self.device is not None:
-            try:
-                info = sd.query_devices(self.device, 'input')
-                hw_rate = int(info['default_samplerate'])
-            except Exception:
-                pass
+        try:
+            dev_idx = self.device if self.device is not None else sd.default.device[0]
+            info = sd.query_devices(dev_idx, 'input')
+            hw_rate = int(info['default_samplerate'])
+            print(f"[VOICE] Input device: {info['name']} ({hw_rate}Hz)")
+        except Exception:
+            pass
 
         need_resample = (hw_rate != self.sample_rate)
         if need_resample:
@@ -250,31 +258,38 @@ class VoiceListener:
             print(f"[VOICE] Hardware rate {hw_rate}Hz, downsampling {ratio}x to {self.sample_rate}Hz")
 
         block_size = hw_rate // 2  # 0.5s of audio at hardware rate
-        try:
-            with sd.RawInputStream(
-                samplerate=hw_rate,
-                blocksize=block_size,
-                device=self.device,
-                dtype='int16',
-                channels=1,
-            ) as stream:
-                print(f"[VOICE] Listening (device={self.device})")
-                while self._running:
-                    data, overflowed = stream.read(block_size)
-                    if need_resample:
-                        samples = np.frombuffer(bytes(data), dtype=np.int16)
-                        samples = samples[::ratio]
-                        audio_bytes = samples.tobytes()
-                    else:
-                        audio_bytes = bytes(data)
-                    if self.recognizer.AcceptWaveform(audio_bytes):
-                        result = json.loads(self.recognizer.Result())
-                        text = result.get('text', '').strip().lower()
-                        if text:
-                            print(f"[VOICE] Heard: '{text}'")
-                            self._match_command(text)
-        except Exception as e:
-            print(f"[VOICE] Audio stream error: {e}")
+        retry_delay = 2.0
+        while self._running:
+            try:
+                with sd.RawInputStream(
+                    samplerate=hw_rate,
+                    blocksize=block_size,
+                    device=self.device,
+                    dtype='int16',
+                    channels=1,
+                ) as stream:
+                    print(f"[VOICE] Listening (device={self.device})")
+                    retry_delay = 2.0  # reset on successful open
+                    while self._running:
+                        data, overflowed = stream.read(block_size)
+                        if need_resample:
+                            samples = np.frombuffer(bytes(data), dtype=np.int16)
+                            samples = samples[::ratio]
+                            audio_bytes = samples.tobytes()
+                        else:
+                            audio_bytes = bytes(data)
+                        if self.recognizer.AcceptWaveform(audio_bytes):
+                            result = json.loads(self.recognizer.Result())
+                            text = result.get('text', '').strip().lower()
+                            if text:
+                                print(f"[VOICE] Heard: '{text}'")
+                                self._match_command(text)
+            except Exception as e:
+                if not self._running:
+                    break  # clean shutdown — don't retry
+                print(f"[VOICE] Audio stream error: {e} — retrying in {retry_delay:.0f}s")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30.0)  # back off up to 30s
 
     def _match_command(self, text):
         for phrase, cmd in self.COMMANDS.items():
@@ -292,11 +307,13 @@ class AudioPlayer:
     """Play pre-recorded WAV responses via pygame.mixer (fallback: aplay)."""
 
     RESPONSES = {
-        'fall_detected':  'fall_detected.wav',
-        'buzzer_stopped': 'buzzer_stopped.wav',
-        'fall_reset':     'fall_reset.wav',
-        'alert_sent':     'alert_sent.wav',
-        'system_ready':   'system_ready.wav',
+        'fall_detected':    'fall_detected.wav',
+        'buzzer_stopped':   'buzzer_stopped.wav',
+        'fall_reset':       'fall_reset.wav',
+        'alert_sent':       'alert_sent.wav',
+        'system_ready':     'system_ready.wav',
+        'photo_sent':       'photo_sent.wav',
+        'alert_cancelled':  'alert_cancelled.wav',
     }
 
     def __init__(self, audio_dir='audio/'):
@@ -414,7 +431,18 @@ class PeripheralManager:
         elif cmd == 'send_alert':
             self.audio.play('alert_sent')
             self.ipc.send_command('send_alert')
-            # trigger SMS/email/notification here
+
+        elif cmd == 'send_photo':
+            self.audio.play('photo_sent')
+            self.ipc.send_command('send_photo')
+
+        elif cmd == 'cancel_alert':
+            self.buzzer.deactivate()
+            self.led.set_state('ok')
+            with self._lock:
+                self._current_state = 'unknown'
+            self.audio.play('alert_cancelled')
+            self.ipc.send_command('cancel_alert')
 
     def run_forever(self):
         try:
@@ -459,8 +487,8 @@ Examples:
     # Vosk
     parser.add_argument("--vosk-model", default="vosk-model-small-en-us-0.15",
                         help="Path to Vosk model directory")
-    parser.add_argument("--mic-device", type=int, default=None,
-                        help="ALSA device index for I2S mic (None = system default)")
+    parser.add_argument("--mic-device", type=int, default=1,
+                        help="sounddevice index for microphone (default: 1 = Google VoiceHAT I2S)")
     # Audio
     parser.add_argument("--audio-dir", default="audio/",
                         help="Directory containing response WAV files")
