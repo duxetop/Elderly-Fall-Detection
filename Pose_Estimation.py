@@ -5,8 +5,8 @@ Usage:
 
 Tuning:
   Threshold tuning example to increase sensitivity: python Pose_Estimation.py --torso-thresh 45 --ratio-thresh 0.9 --hf-thresh 50
-  Angled camera (e.g. 15° clockwise tilt): python Pose_Estimation.py --camera-tilt 15
-  High camera (e.g. mounted at 30° above horizontal): python Pose_Estimation.py --camera-elevation 30
+  Angled camera (e.g. 15deg clockwise tilt): python Pose_Estimation.py --camera-tilt 15
+  High camera (e.g. mounted at 30deg above horizontal): python Pose_Estimation.py --camera-elevation 30
 
 """
 
@@ -108,24 +108,50 @@ class SocketState:
 
 # IMU-based fall analysis
 class IMUAnalyzer:
-    """Analyze accelerometer/gyroscope CSV data for fall indicators
+    """Analyze accelerometer/gyroscope CSV data for fall indicators.
 
     Computes Sum Vector Magnitude (SVM) from raw accelerometer readings
-    and finds  free-fall + impact patterns
+    and finds free-fall + impact patterns.
 
+    Tilt is measured relative to a learned standing baseline so the sensor
+    orientation does not need to be known in advance.  The first few packets
+    where SVM ~ 1g (person is upright and still) are used to record the
+    gravity vector direction; subsequent packets measure how far the current
+    gravity vector has rotated from that reference.
     """
-    ACCEL_SCALE = 16384.0   # LSB/g for ±2g range
-    GYRO_SCALE = 131.0      # LSB/(°/s) for ±250°/s range
+    ACCEL_SCALE = 16384.0   # LSB/g for +/-2g range
+    GYRO_SCALE = 131.0      # LSB/(deg/s) for +/-250deg/s range
 
-    # Thresholds (in g and °/s)
-    FREEFALL_THRESH = 0.5   # SVM below this = free fall 
-    IMPACT_THRESH = 2.0     # SVM above this = impact 
-    GYRO_THRESH = 150.0     # angular velocity spike 
+    # Thresholds (in g and deg/s)
+    FREEFALL_THRESH = 0.5   # SVM below this = free fall
+    IMPACT_THRESH = 2.0     # SVM above this = impact
+    GYRO_THRESH = 150.0     # angular velocity spike
     SVM_STD_THRESH = 0.3    # high variance = turbulent motion
+    TILT_THRESH = 60.0      # degrees from standing baseline -> phone horizontal
+    GYRO_ROTATION_THRESH = 45.0  # cumulative degrees in window -> rapid tumble
+
+    # Baseline calibration
+    BASELINE_PACKETS = 5    # number of quiet upright packets to average for baseline
+
+    BASELINE_FILE = '/tmp/imu_baseline.npy'
 
     def __init__(self):
         self.last_score = 0.0
         self.last_score_t = 0.0
+        self.last_tilt = 0.0
+        self._baseline_gravity = None
+        self._baseline_samples = []
+
+        # Load saved baseline so calibration survives restarts
+        if os.path.exists(self.BASELINE_FILE):
+            try:
+                self._baseline_gravity = np.load(self.BASELINE_FILE)
+                print(f"[IMU] Baseline loaded from disk: {self._baseline_gravity.round(3)}")
+            except Exception:
+                pass
+
+        if self._baseline_gravity is None:
+            print("[IMU] No baseline found - stand still for ~25s to calibrate")
 
     def analyze(self, csv_content):
         """Analyze IMU CSV and return a fall score 0.0-1.0.
@@ -171,16 +197,56 @@ class IMUAnalyzer:
             # Scale contribution--> 2g = 0.2, 4g+ = 0.35
             score += min(0.35, 0.2 + (impact_peak - self.IMPACT_THRESH) * 0.075)
 
-        # Gyroscope spike --> rapid rotation during fall
+        # Gyroscope spike: rapid rotation during fall event
         gyro_peak = gyro_mag.max()
         if gyro_peak > self.GYRO_THRESH:
             score += min(0.2, (gyro_peak - self.GYRO_THRESH) / 500.0 * 0.2)
+
+        # Gyroscope cumulative rotation: integrate angular velocity over window
+        # Large cumulative rotation = person tumbled/rotated rapidly
+        n = len(gx)
+        dt = 0.2 / max(n, 1)  # assume 0.2s window, uniform sampling
+        cum_rot = max(
+            abs(np.cumsum(gx * dt)).max(),
+            abs(np.cumsum(gy * dt)).max(),
+            abs(np.cumsum(gz * dt)).max(),
+        )
+        if cum_rot > self.GYRO_ROTATION_THRESH:
+            score += min(0.25, (cum_rot - self.GYRO_ROTATION_THRESH) / 90.0 * 0.25)
+
+        # Tilt detection relative to learned standing baseline
+        mean_accel = np.array([ax.mean(), ay.mean(), az.mean()])
+        mean_svm = float(np.linalg.norm(mean_accel))
+
+        if self._baseline_gravity is None:
+            # Calibration phase: collect quiet upright packets (SVM ~ 1g, low variance)
+            if 0.85 < mean_svm < 1.15 and svm.std() < 0.05:
+                self._baseline_samples.append(mean_accel / (mean_svm + 1e-6))
+                if len(self._baseline_samples) >= self.BASELINE_PACKETS:
+                    self._baseline_gravity = np.mean(self._baseline_samples, axis=0)
+                    self._baseline_gravity /= np.linalg.norm(self._baseline_gravity)
+                    print(f"[IMU] Standing baseline calibrated: {self._baseline_gravity.round(3)}")
+                    try:
+                        np.save(self.BASELINE_FILE, self._baseline_gravity)
+                        print(f"[IMU] Baseline saved to {self.BASELINE_FILE}")
+                    except Exception as e:
+                        print(f"[IMU] Could not save baseline: {e}")
+            mean_tilt = 0.0  # no tilt score until calibrated
+        else:
+            # Measure angle between current gravity vector and standing baseline
+            cur_gravity = mean_accel / (mean_svm + 1e-6)
+            dot = float(np.clip(np.dot(cur_gravity, self._baseline_gravity), -1.0, 1.0))
+            mean_tilt = math.degrees(math.acos(dot))
+
+        if mean_tilt > self.TILT_THRESH:
+            score += min(0.35, (mean_tilt - self.TILT_THRESH) / 30.0 * 0.35)
 
         # SVM variance: high variance = turbulent motion (fall + impact)
         svm_std = svm.std()
         if svm_std > self.SVM_STD_THRESH:
             score += 0.1
 
+        self.last_tilt = mean_tilt
         self.last_score = min(1.0, score)
         self.last_score_t = time.time()
         return self.last_score
@@ -308,8 +374,10 @@ class SnapshotServer:
             f"Content-Type: image/jpeg\r\n\r\n"
         ).encode() + jpg_bytes + f"\r\n--{boundary}--\r\n".encode()
 
+        # Server upload endpoint is POST / (root), file served at /uploads/<name>
+        protocol = 'http' if self.base_url.startswith('localhost') or self.base_url.startswith('127.') else 'https'
         req = urllib.request.Request(
-            f"https://{self.base_url}",
+            f"{protocol}://{self.base_url}/",
             data=body,
             headers={'Content-Type': f'multipart/form-data; boundary={boundary}'},
             method='POST',
@@ -332,7 +400,7 @@ class SnapshotServer:
 class CameraCalibrator:
     """Auto-calibrate camera roll (tilt) from standing-pose skeleton geometry.
 
-    When a person stands upright the shoulder→hip vector should point straight down.
+    When a person stands upright the shoulder->hip vector should point straight down.
     Any measured deviation from vertical equals the camera roll angle.
 
     Samples are collected whenever the person appears roughly upright
@@ -380,9 +448,9 @@ class CameraCalibrator:
 
         torso_len = math.sqrt(dy ** 2 + dx ** 2)
         if torso_len < 0.05 or dy < 0.05:
-            return  # too short, horizontal, or ambiguous — skip
+            return  # too short, horizontal, or ambiguous - skip
 
-        # Camera tilt = angle of shoulder→hip vector from straight-down [0, +1]
+        # Camera tilt = angle of shoulder->hip vector from straight-down [0, +1]
         tilt = math.degrees(math.atan2(dx, dy))
         self._samples.append(tilt)
         self._frame_count += 1
@@ -397,12 +465,12 @@ class CameraCalibrator:
         self.tilt_deg = samples[len(samples) // 2]
         self.calibrated = True
         if first:
-            print(f"[CALIB] Camera tilt auto-calibrated: {self.tilt_deg:+.1f}° "
+            print(f"[CALIB] Camera tilt auto-calibrated: {self.tilt_deg:+.1f}deg "
                   f"(from {len(self._samples)} samples)")
 
     @property
     def progress(self):
-        """0.0–1.0: how far towards the first calibration commit."""
+        """0.0-1.0: how far towards the first calibration commit."""
         return min(1.0, len(self._samples) / self.MIN_SAMPLES)
 
     @property
@@ -422,7 +490,7 @@ class CameraStream:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # Disable auto white balance unconditionally — keeps colour consistent
+        # Disable auto white balance unconditionally - keeps colour consistent
         self.cap.set(cv2.CAP_PROP_AUTO_WB, 0)
         self.cap.set(cv2.CAP_PROP_WB_TEMPERATURE, 4600)  # neutral daylight WB
 
@@ -468,7 +536,7 @@ class AsyncModel:
     """Submit a frame for inference; retrieve result on the next call.
 
     The main loop calls submit(frame) and gets the *previous* result back
-    immediately — no waiting. One frame of latency, but main loop FPS is
+    immediately - no waiting. One frame of latency, but main loop FPS is
     unaffected by inference time.
     """
 
@@ -525,7 +593,7 @@ class PoseModel:
         print(f"  Threads: 4")
 
     def run(self, frame):
-        # Resize first (smaller data), then BGR→RGB
+        # Resize first (smaller data), then BGR->RGB
         resized = cv2.resize(frame, (self.input_w, self.input_h))
         resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         if self.input_dtype == np.float32:
@@ -667,7 +735,7 @@ def apply_tilt_correction(kps, tilt_deg):
         kps: (17, 3) array of [y, x, confidence] in normalised [0,1] coords.
         tilt_deg: camera tilt in degrees; positive = camera rotated clockwise.
     Returns:
-        corrected copy of kps (17, 3) — confidences unchanged.
+        corrected copy of kps (17, 3) - confidences unchanged.
     """
     if tilt_deg == 0.0:
         return kps
@@ -690,7 +758,7 @@ def apply_elevation_correction(kps, elev_deg):
                   90=straight down). Values outside [5, 85] are clamped to
                   avoid division by ~zero.
     Returns:
-        corrected copy of kps (17, 3) — confidences unchanged.
+        corrected copy of kps (17, 3) - confidences unchanged.
     """
     if elev_deg == 0.0:
         return kps
@@ -708,12 +776,12 @@ def is_upright(f, torso_t=35, ratio_t=1.0):
 def fall_score(f, torso_t=50, ratio_t=1.0, hf_t=55,
                velocity=0.0, vel_thresh=0.012,
                height_ratio=1.0, height_collapse=0.5,
-               imu_score=0.0, cy_drop=0.0):
+               imu_score=0.0, cy_drop=0.0, camera_active=True):
     """Compute a weighted fall score 0.0-1.0 from all available signals.
 
     Each metric contributes a partial score based on how far it exceeds
     its threshold. This handles distance/angle variation because no single
-    metric needs to fully trigger — several borderline signals combine.
+    metric needs to fully trigger - several borderline signals combine.
 
     Returns:
         float: 0.0 = clearly upright, 1.0 = clearly fallen
@@ -754,19 +822,21 @@ def fall_score(f, torso_t=50, ratio_t=1.0, hf_t=55,
             horiz += 0.5 * min(1.0, xs / 0.5)
         s += 0.15 * min(1.0, horiz)
 
-    # 5) Velocity (rapid drop): 0-0.20  (raised from 0.10 — key for parallel falls)
+    # 5) Velocity (rapid drop): 0-0.20  (raised from 0.10 - key for parallel falls)
     if velocity > vel_thresh * 0.5:
         s += 0.20 * min(1.0, velocity / (vel_thresh * 2 + 1e-6))
 
-    # 6) Height collapse: 0-0.20  (raised from 0.10 — key for parallel/side falls)
+    # 6) Height collapse: 0-0.20  (raised from 0.10 - key for parallel/side falls)
     if height_ratio < 1.0:
         collapse = 1.0 - height_ratio  # 0 = standing, 1 = zero height
         collapse_thresh = 1.0 - height_collapse  # 0.5
         if collapse > collapse_thresh * 0.5:
             s += 0.20 * min(1.0, collapse / (collapse_thresh + 1e-6))
 
-    # 7) IMU boost: 0-0.15
-    s += 0.15 * imu_score
+    # 7) IMU boost: 0-0.15 normally, 0-0.25 when camera is actively tracking
+    #    Higher weight when both camera and IMU agree — more reliable combined signal
+    imu_weight = 0.25 if camera_active else 0.15
+    s += imu_weight * imu_score
 
     # 8) Floor-level paradox: 0-0.50
     #    Person appears upright in 2D (torso/ratio metrics low) but their center of
@@ -809,6 +879,7 @@ class FallTracker:
         self.confirm_time = confirm_time
         self.cooldown = cooldown
         self.frames_missing = 0
+        self.inference_gated = False   # set True by main loop when motion gate suppresses inference
         self._first_detection = True
         self._start_time = time.time()
         self._startup_grace = self.STARTUP_GRACE if startup_grace is None else startup_grace
@@ -825,8 +896,8 @@ class FallTracker:
         self.current_fall_score = 0.0       # latest weighted fall score
 
         # Standing center_y baseline: where the person's center of mass sits in the
-        # image while upright.  A large drop below this — even if the 2D skeleton
-        # still looks "upright" — means the person is at floor level (face-down fall
+        # image while upright.  A large drop below this - even if the 2D skeleton
+        # still looks "upright" - means the person is at floor level (face-down fall
         # toward the camera fools torso/ratio metrics but not center_y position).
         self._upright_cy = deque(maxlen=self.HEIGHT_BASELINE_FRAMES)
         self.baseline_center_y = None       # median center_y from upright frames
@@ -835,6 +906,7 @@ class FallTracker:
         # Sustained fall tracking: detect slow / angle-obscured falls that never
         # had a recent upright frame (transition_t gate would otherwise block them)
         self._fell_since = None             # time when fell score first exceeded threshold in unknown
+        self._imu_triggered_fall = False    # True when fall was fired by IMU standalone (not camera)
 
         # Debug histories
         self.torso_hist = deque(maxlen=90)
@@ -845,16 +917,16 @@ class FallTracker:
         self.fall_score_hist = deque(maxlen=90)
 
     # Tracking loss thresholds (in frames at ~30fps)
-    MISSING_CONFIRM_FALL = 20    # ~0.7s: lost during potential_fall → confirm fall
+    MISSING_CONFIRM_FALL = 20    # ~0.7s: lost during potential_fall -> confirm fall
     MISSING_KEEP_FALLEN = 300    # ~10s: stay fallen even without keypoints
-    MISSING_RESET_UNKNOWN = 90   # ~3s: lost in unknown state → stay unknown (no action)
+    MISSING_RESET_UNKNOWN = 90   # ~3s: lost in unknown state -> stay unknown (no action)
 
     def update(self, feat, now, torso_t, ratio_t, hf_t, transition_t=1.5, record_debug=False, imu_score=0.0):
         if feat is None:
             self.frames_missing += 1
 
             if self.state == 'potential_fall':
-                # Person was falling and model lost them → likely on the ground
+                # Person was falling and model lost them -> likely on the ground
                 if self.frames_missing > self.MISSING_CONFIRM_FALL:
                     if (now - self.last_alert_t) > self.cooldown:
                         self.last_alert_t = now
@@ -863,7 +935,7 @@ class FallTracker:
                     self.state = 'fallen'
 
             elif self.state == 'fallen':
-                # Stay fallen — horizontal person is hard to detect
+                # Stay fallen - horizontal person is hard to detect
                 # Only reset after extended period (person may have left the scene)
                 if self.frames_missing > self.MISSING_KEEP_FALLEN:
                     self.state = 'unknown'
@@ -925,6 +997,7 @@ class FallTracker:
             height_ratio=self.height_ratio, height_collapse=self.HEIGHT_COLLAPSE_RATIO,
             imu_score=imu_score,
             cy_drop=self.cy_drop,
+            camera_active=(feat is not None),
         )
         fell = self.current_fall_score >= 0.45
 
@@ -957,7 +1030,7 @@ class FallTracker:
 
         if self.state == 'unknown':
             # IMU direct trigger: strong free-fall+impact reading bypasses
-            # the pose wait entirely — IMU sees the fall event in real-time
+            # the pose wait entirely - IMU sees the fall event in real-time
             imu_direct = imu_score >= 0.70
 
             triggered = fell or motion_trigger or imu_direct
@@ -970,7 +1043,7 @@ class FallTracker:
             else:
                 self._fell_since = None
 
-            # Normal path: recent upright frame → potential_fall
+            # Normal path: recent upright frame -> potential_fall
             if (now - self.last_upright_t) < transition_t and triggered:
                 self.state = 'potential_fall'
                 self.fall_start_t = now
@@ -1014,6 +1087,7 @@ class FallTracker:
                 self.state = 'unknown'
                 self.cy_history.clear()
                 self._fell_since = None
+                self._imu_triggered_fall = False
                 event = 'recovered'
 
         return event
@@ -1056,7 +1130,8 @@ def draw_debug(frame, tracker, thresholds, socket_state=None, imu_analyzer=None,
     """Render debug info into a separate side panel and return it."""
     h = frame.shape[0]
     pw = 260
-    panel = np.zeros((h, pw + 10, 3), dtype=np.uint8)
+    # Allocate a tall panel so content never gets cut off; crop to frame height at the end
+    panel = np.zeros((1800, pw + 10, 3), dtype=np.uint8)
 
     feat = tracker.last_features
     x = 5
@@ -1072,7 +1147,7 @@ def draw_debug(frame, tracker, thresholds, socket_state=None, imu_analyzer=None,
 
     if feat is None:
         cv2.putText(panel, "No keypoints (need shoulders + hips)", (x,y), F, 0.35, G, 1)
-        return panel
+        return panel[:h]
 
     tt, rt, ht = thresholds['torso'], thresholds['ratio'], thresholds['hf']
 
@@ -1168,7 +1243,7 @@ def draw_debug(frame, tracker, thresholds, socket_state=None, imu_analyzer=None,
         # Threshold line
         tr = max(0, min(1, (thresh - vmin) / (vmax - vmin + 1e-6)))
         cv2.line(panel, (x, y + gh - int(tr*gh)), (x+gw, y + gh - int(tr*gh)), (0,0,255), 1)
-        # Data line — sample every other point for speed
+        # Data line - sample every other point for speed
         pts = list(data)
         n = len(pts)
         step = max(1, n // 60)  # limit to ~60 points
@@ -1220,11 +1295,17 @@ def draw_debug(frame, tracker, thresholds, socket_state=None, imu_analyzer=None,
             if imu_s > 0:
                 reduction = int(imu_s * 50)
                 imu_c = (0, 0, 255) if imu_s >= 0.6 else (0, 165, 255) if imu_s >= 0.3 else (0, 200, 100)
-                imu_txt = f"IMU: {imu_s:.2f} (confirm -{reduction}%)"
+                imu_txt = f"IMU score: {imu_s:.2f} (confirm -{reduction}%)"
             else:
                 imu_c = G
-                imu_txt = "IMU: no data"
+                imu_txt = "IMU score: no data"
             cv2.putText(panel, imu_txt, (x, y), F, 0.35, imu_c, 1)
+            y += 16
+            tilt = imu_analyzer.last_tilt
+            cal = imu_analyzer._baseline_gravity is not None
+            tilt_c = (0, 0, 255) if tilt > 75.0 else (0, 165, 255) if tilt > 60.0 else (0, 200, 100)
+            cal_str = "cal" if cal else "uncal"
+            cv2.putText(panel, f"IMU tilt: {tilt:.1f} deg ({cal_str})", (x, y), F, 0.35, tilt_c, 1)
             y += 16
 
             # IMU breakdown bar
@@ -1279,7 +1360,8 @@ def draw_debug(frame, tracker, thresholds, socket_state=None, imu_analyzer=None,
         cv2.putText(panel, calib_txt, (x, y), F, 0.35, calib_c, 1)
         y += 14
 
-    return panel
+    # Return only the filled portion (y + small margin), not the full 1800px allocation
+    return panel[:min(y + 20, 1800)]
 
 
 # WebSocket background thread
@@ -1287,8 +1369,8 @@ def start_ws_background(args, socket_state, cam_tracker, imu_analyzer=None, ipc=
     """Start a WebSocket client in a daemon thread.
 
     Receives CSV URLs from the phone and runs fall detection on them.
-    When the camera is unavailable the IMU path fires fall events directly —
-    IPC to the peripheral controller and notification to the phone — so the
+    When the camera is unavailable the IMU path fires fall events directly -
+    IPC to the peripheral controller and notification to the phone - so the
     system works with camera, IMU, or both independently.
     """
     _last_imu_alert_t = [0.0]  # closure-safe cooldown for IMU-standalone alerts
@@ -1332,7 +1414,7 @@ def start_ws_background(args, socket_state, cam_tracker, imu_analyzer=None, ipc=
                 continue
 
         if first_data_row and len(first_data_row) == 6 and imu_analyzer:
-            # IMU data — primary OR standalone fall detection
+            # IMU data - primary OR standalone fall detection
             score = imu_analyzer.analyze(csv_content)
             phone_result = 'fall' if score >= 0.5 else 'no_fall'
             print(f"[WS] IMU analysis: score={score:.2f} -> {phone_result}")
@@ -1341,19 +1423,53 @@ def start_ws_background(args, socket_state, cam_tracker, imu_analyzer=None, ipc=
             # This mirrors the camera fall path so buzzer/LED/phone all activate
             # even when the camera is blocked, offline, or sees nothing.
             now = time.time()
+            # Camera is not providing fresh data when:
+            #   a) covered/blocked: no keypoints for >0.5s
+            #   b) inference gated: motion threshold suppressed the model run
+            camera_blind = (
+                cam_tracker.frames_missing > 15
+                or cam_tracker.inference_gated
+            )
             imu_fall = (
                 score >= 0.5
                 and cam_tracker.state != 'fallen'
                 and (now - _last_imu_alert_t[0]) > cam_tracker.cooldown
             )
-            if imu_fall:
+            # Aggressive tilt trigger: fires when camera is blind (covered or gated)
+            # tilt alone isn't reliable enough when the camera is actively tracking
+            tilt_trigger = (
+                imu_analyzer.last_tilt > 60.0
+                and imu_analyzer._baseline_gravity is not None
+                and camera_blind
+                and cam_tracker.state != 'fallen'
+                and (now - _last_imu_alert_t[0]) > cam_tracker.cooldown
+            )
+            if imu_fall or tilt_trigger:
+                reason = f"tilt={imu_analyzer.last_tilt:.1f}deg" if (tilt_trigger and not imu_fall) else f"score={score:.2f}"
                 _last_imu_alert_t[0] = now
                 cam_tracker.state = 'fallen'
                 cam_tracker.last_alert_t = now
-                print(f"[WS] IMU standalone fall detected (score={score:.2f})")
+                cam_tracker._imu_triggered_fall = True
+                print(f"[WS] IMU standalone fall detected ({reason})")
                 if ipc:
                     ipc.send({'type': 'event', 'event': 'fall_detected', 'ts': now})
                 socket_state.send(json.dumps({'target': 'phone', 'data': ['fall']}))
+
+            # IMU tilt reset: if this fall was IMU-triggered and the person's
+            # motion has returned to normal (low score on new reading), recover
+            elif (
+                cam_tracker.state == 'fallen'
+                and cam_tracker._imu_triggered_fall
+                and score < 0.15
+            ):
+                cam_tracker.state = 'unknown'
+                cam_tracker._imu_triggered_fall = False
+                cam_tracker._fell_since = None
+                cam_tracker.cy_history.clear()
+                print(f"[WS] IMU tilt reset — fall state cleared (score={score:.2f})")
+                if ipc:
+                    ipc.send({'type': 'event', 'event': 'recovered', 'ts': now})
+                socket_state.send(json.dumps({'target': 'phone', 'data': ['cancel']}))
         else:
             # Keypoint data
             try:
@@ -1426,7 +1542,7 @@ def process_csv(url_or_content, args, raw=False):
         kps = apply_tilt_correction(kps, getattr(args, 'camera_tilt', 0.0))
         kps = apply_elevation_correction(kps, getattr(args, 'camera_elevation', 0.0))
         features = find_features(kps, args.score_thresh)
-        # transition_t=9999: don't require prior upright state — clip may start mid-fall
+        # transition_t=9999: don't require prior upright state - clip may start mid-fall
         ev = tracker.update(features, now, args.torso_thresh, args.ratio_thresh, args.hf_thresh,
                             transition_t=9999)
         now += 0.033  # simulate ~30 fps timestamps
@@ -1471,7 +1587,7 @@ Examples:
                              "vertical foreshortening caused by a high-mounted camera.")
     parser.add_argument("--no-auto-exposure", action="store_true", help="Lock camera to manual exposure instead of auto")
     parser.add_argument("--exposure", type=int, default=95,
-                        help="Exposure value (default: 95, lower = darker). Always applied — auto WB is always off.")
+                        help="Exposure value (default: 95, lower = darker). Always applied - auto WB is always off.")
     parser.add_argument("--no-auto-calibrate", action="store_true",
                         help="Disable auto-calibration of camera tilt; use --camera-tilt value directly")
     parser.add_argument("--motion-thresh", type=int, default=800,
@@ -1481,8 +1597,8 @@ Examples:
     parser.add_argument("--ipc", action="store_true", help="Enable IPC server for peripheral controller")
     parser.add_argument("--ipc-sock", default="/tmp/falldetect.sock", help="Unix socket path for IPC")
     parser.add_argument("--ws", action="store_true", help="Run in WebSocket hub mode (receive CSV, process, reply)")
-    parser.add_argument("--ws-url", default="wss://1327-68-148-232-205.ngrok-free.app/ws?id=hub", help="WebSocket endpoint URL")
-    parser.add_argument("--upload-url", default="1327-68-148-232-205.ngrok-free.app",
+    parser.add_argument("--ws-url", default="ws://localhost:8080/ws?id=hub", help="WebSocket endpoint URL")
+    parser.add_argument("--upload-url", default="unabsorbing-perla-subsequently.ngrok-free.dev",
                         help="Base URL to upload snapshots to (default: ngrok endpoint)")
     parser.add_argument("--no-snapshot-server", action="store_true",
                         help="Disable snapshot upload (no pic messages sent to phone)")
@@ -1499,7 +1615,7 @@ Examples:
         snap = SnapshotServer(base_url=args.upload_url)
         snap.start()
 
-    # Shared frame reference — updated each iteration so IPC commands can grab it
+    # Shared frame reference - updated each iteration so IPC commands can grab it
     _current_frame = [None]
 
     ipc = None
@@ -1516,13 +1632,13 @@ Examples:
                 print("[IPC] Fall state reset")
 
             elif cmd == 'send_alert':
-                # Voice said "call help" — push fall alert to phone
+                # Voice said "call help" - push fall alert to phone
                 if socket_state:
                     socket_state.send(json.dumps({'target': 'phone', 'data': ['fall']}))
                 print("[IPC] Alert sent to phone via voice command")
 
             elif cmd == 'cancel_alert':
-                # Voice said "false alarm" — tell phone to dismiss
+                # Voice said "false alarm" - tell phone to dismiss
                 if socket_state:
                     socket_state.send(json.dumps({'target': 'phone', 'data': ['cancel']}))
                 tracker.state = 'unknown'
@@ -1531,7 +1647,7 @@ Examples:
                 print("[IPC] Alert cancelled, phone notified")
 
             elif cmd == 'send_photo':
-                # Voice said "take photo" — capture current frame and send URL to phone
+                # Voice said "take photo" - capture current frame and send URL to phone
                 frame = _current_frame[0]
                 if frame is not None and snap is not None and socket_state:
                     url = snap.capture(frame)
@@ -1566,7 +1682,7 @@ Examples:
         print(f"  Thunder cascade: disabled")
     print(f"  Camera: {args.camera} ({args.width}x{args.height}) | Skip: every {args.skip_frames} frame(s)")
     if args.no_auto_calibrate:
-        print(f"  Tilt: manual {args.camera_tilt:+.1f}°  Elevation: {args.camera_elevation:.1f}°")
+        print(f"  Tilt: manual {args.camera_tilt:+.1f}deg  Elevation: {args.camera_elevation:.1f}deg")
     else:
         print(f"  Tilt: AUTO-CALIBRATE (collecting {CameraCalibrator.MIN_SAMPLES} upright frames)")
         if args.camera_tilt != 0.0:
@@ -1584,6 +1700,7 @@ Examples:
     # Wait for first frame
     time.sleep(0.5)
     show_debug = args.debug
+    _debug_window_open = False
 
     fps_time = time.time()
     fps_count = 0
@@ -1624,12 +1741,14 @@ Examples:
             # Only run background subtraction every inference frame (not every frame)
             fg_mask = _mog.apply(frame)
             motion_px = int(np.count_nonzero(fg_mask))
-            # Always run inference when tracking an alert state — never gate those
+            # Always run inference when tracking an alert state - never gate those
             skip_inference = (
                 args.motion_thresh > 0
                 and motion_px < args.motion_thresh
                 and tracker.state == 'unknown'
             )
+
+            tracker.inference_gated = skip_inference
 
             if not skip_inference:
                 # --- ROI cropping ---
@@ -1665,7 +1784,7 @@ Examples:
                 if roi_crop is not None:
                     crop_img, rx1, ry1, rx2, ry2 = roi_crop
                     raw_kps = active_model.run(crop_img)
-                    # Remap normalised keypoint coords from crop → full frame
+                    # Remap normalised keypoint coords from crop -> full frame
                     if raw_kps is not None:
                         last_kps = raw_kps.copy()
                         last_kps[:, 0] = ry1 + raw_kps[:, 0] * (ry2 - ry1)
@@ -1792,12 +1911,17 @@ Examples:
         cv2.putText(frame, f"FPS:{fps_val:.0f} inf:{inf_ms:.0f}ms [{model_tag}] mot:{motion_px}{gated_tag}",
                     (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
 
-        # Debug panel
+        # Scale main frame up for easier viewing (inference still at native res)
+        display = cv2.resize(frame, (frame.shape[1] * 3, frame.shape[0] * 3))
+
+        # Debug panel in its own window so proportions stay correct
         if show_debug:
             debug_panel = draw_debug(frame, tracker, thresholds, socket_state, imu_analyzer, calibrator)
-            display = np.hstack([frame, debug_panel])
-        else:
-            display = frame
+            cv2.imshow('Debug', debug_panel)
+            _debug_window_open = True
+        elif _debug_window_open:
+            cv2.destroyWindow('Debug')
+            _debug_window_open = False
 
         cv2.imshow('Fall Detection', display)
         key = cv2.waitKey(1) & 0xFF

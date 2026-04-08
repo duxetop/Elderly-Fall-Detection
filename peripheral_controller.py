@@ -261,23 +261,26 @@ class VoiceListener:
         retry_delay = 2.0
         while self._running:
             try:
+                # VoiceHAT requires 2 channels (stereo); take left channel only
+                dev_info = sd.query_devices(self.device, 'input')
+                n_ch = min(2, int(dev_info['max_input_channels']))
                 with sd.RawInputStream(
                     samplerate=hw_rate,
                     blocksize=block_size,
                     device=self.device,
                     dtype='int16',
-                    channels=1,
+                    channels=n_ch,
                 ) as stream:
                     print(f"[VOICE] Listening (device={self.device})")
                     retry_delay = 2.0  # reset on successful open
                     while self._running:
                         data, overflowed = stream.read(block_size)
+                        samples = np.frombuffer(bytes(data), dtype=np.int16)
+                        if n_ch == 2:
+                            samples = samples[::2]  # left channel only
                         if need_resample:
-                            samples = np.frombuffer(bytes(data), dtype=np.int16)
                             samples = samples[::ratio]
-                            audio_bytes = samples.tobytes()
-                        else:
-                            audio_bytes = bytes(data)
+                        audio_bytes = samples.tobytes()
                         if self.recognizer.AcceptWaveform(audio_bytes):
                             result = json.loads(self.recognizer.Result())
                             text = result.get('text', '').strip().lower()
@@ -287,7 +290,7 @@ class VoiceListener:
             except Exception as e:
                 if not self._running:
                     break  # clean shutdown — don't retry
-                print(f"[VOICE] Audio stream error: {e} — retrying in {retry_delay:.0f}s")
+                print(f"[VOICE] Audio stream error: {e} - retrying in {retry_delay:.0f}s")
                 time.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 30.0)  # back off up to 30s
 
@@ -344,8 +347,11 @@ class AudioPlayer:
             except Exception as e:
                 print(f"[AUDIO] Playback error: {e}")
         else:
+            # Use paplay (PulseAudio) so Bluetooth speakers are reached;
+            # fall back to aplay headphone jack if PulseAudio unavailable
+            # pw-play routes through PipeWire so Bluetooth speakers are reached
             subprocess.Popen(
-                ['aplay', '-D', 'plughw:0,0', filepath],
+                ['pw-play', filepath],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def cleanup(self):
@@ -487,8 +493,8 @@ Examples:
     # Vosk
     parser.add_argument("--vosk-model", default="vosk-model-small-en-us-0.15",
                         help="Path to Vosk model directory")
-    parser.add_argument("--mic-device", type=int, default=1,
-                        help="sounddevice index for microphone (default: 1 = Google VoiceHAT I2S)")
+    parser.add_argument("--mic-device", type=int, default=3,
+                        help="sounddevice index for microphone (default: 3 = Google VoiceHAT I2S)")
     # Audio
     parser.add_argument("--audio-dir", default="audio/",
                         help="Directory containing response WAV files")

@@ -3,8 +3,9 @@ import json
 import _thread
 import rel
 
-UPLOAD_URL = 'https://1327-68-148-232-205.ngrok-free.app/uploads/imu_data.csv'
-WS_URL     = 'wss://1327-68-148-232-205.ngrok-free.app/ws?id=phone'
+NGROK_URL  = 'unabsorbing-perla-subsequently.ngrok-free.dev'
+UPLOAD_URL = f'https://{NGROK_URL}/uploads/imu_data.csv'
+WS_URL     = f'wss://{NGROK_URL}/ws?id=phone'
 
 
 def on_message(ws, message):
